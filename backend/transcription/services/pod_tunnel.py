@@ -203,7 +203,7 @@ class PodTunnelManager:
         self.current_port = None
         self.local_port = 8005
         self.is_running = False
-        self._action_lock = threading.Lock()
+        self._action_lock = threading.RLock()
 
     def is_tunnel_active(self, host: str = "127.0.0.1", port: int = 8005) -> bool:
         """Verifica si el puerto local está abierto y respondiendo."""

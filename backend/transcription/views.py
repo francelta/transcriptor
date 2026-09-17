@@ -719,6 +719,19 @@ class PodStatusView(APIView):
         is_listening = orchestrator.is_port_listening(port=local_port)
         is_healthy = orchestrator.check_health(local_port=local_port)
 
+        # Si el pod está listo pero el túnel local se desconectó, reconectarlo automáticamente
+        if not is_healthy and config.pod_host and config.pod_ssh_port and config.provision_status == "ready":
+            try:
+                orchestrator.start_tunnel(
+                    config.pod_host,
+                    config.pod_ssh_port,
+                    config.ssh_key_path or "~/.ssh/id_rsa",
+                    local_port=local_port
+                )
+                is_healthy = orchestrator.check_health(local_port=local_port)
+            except Exception as e:
+                logger.debug(f"Auto-restoration of tunnel in PodStatusView: {e}")
+
         if is_healthy:
             return Response({
                 "status": "connected",
@@ -1345,7 +1358,6 @@ class PodProvisionEventsView(View):
         response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"
         response["X-Accel-Buffering"] = "no"
-        response["Connection"] = "keep-alive"
         return response
 
 

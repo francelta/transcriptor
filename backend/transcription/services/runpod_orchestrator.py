@@ -447,7 +447,7 @@ class RunPodOrchestrator:
         self.current_port = None
         self.local_port = 8005
         self.is_running = False
-        self._action_lock = threading.Lock()
+        self._action_lock = threading.RLock()
 
     def is_port_listening(self, host: str = "127.0.0.1", port: int = 8005) -> bool:
         """Comprueba si el socket TCP local responde."""
