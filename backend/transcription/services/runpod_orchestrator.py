@@ -54,6 +54,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 import whisperx
 from whisperx.diarize import DiarizationPipeline
+from faster_whisper import WhisperModel
 from typing import Optional
 
 app = FastAPI(title="TranscriberStudio Remote GPU Worker")
@@ -62,33 +63,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-whisperx_model = None
-align_models_cache = {}
+whisper_model = None
 diarize_pipeline = None
 
-def get_whisperx_model():
-    global whisperx_model
-    if whisperx_model is None:
-        print(f"[Worker] Cargando WhisperX (large-v3) en {DEVICE} ({COMPUTE_TYPE})...")
-        whisperx_model = whisperx.load_model(
+def get_whisper_model():
+    global whisper_model
+    if whisper_model is None:
+        print(f"[Worker] Cargando Whisper (large-v3) en {DEVICE} ({COMPUTE_TYPE})...")
+        whisper_model = WhisperModel(
             "large-v3",
             device=DEVICE,
-            compute_type=COMPUTE_TYPE,
-            language="es"
+            compute_type=COMPUTE_TYPE
         )
-    return whisperx_model
-
-def get_align_model(language_code: str):
-    global align_models_cache
-    if language_code not in align_models_cache:
-        print(f"[Worker] Cargando modelo de alineación fonética para idioma '{language_code}'...")
-        try:
-            model_a, metadata = whisperx.load_align_model(language_code=language_code, device=DEVICE)
-            align_models_cache[language_code] = (model_a, metadata)
-        except Exception as e:
-            print(f"[Worker] Error cargando modelo de alineación para {language_code}: {e}")
-            align_models_cache[language_code] = None
-    return align_models_cache[language_code]
+    return whisper_model
 
 def get_diarization_pipeline(hf_token: str = None):
     global diarize_pipeline
@@ -219,54 +206,134 @@ async def transcribe(
 
         try:
             audio = whisperx.load_audio(wav_path)
-
-            # ── 2. Transcripción con WhisperX (large-v3, batch_size=16) ──
-            model = get_whisperx_model()
-            print("[Worker] Ejecutando transcripción WhisperX (large-v3)...")
-            result = model.transcribe(audio, batch_size=16)
-            detected_lang = result.get("language", "es")
-            print(f"[Worker] Transcripción completada. Idioma detectado: {detected_lang}")
-
-            # ── 3. Alineación Fonética Forzada (Wav2Vec2 palabra por palabra) ──
-            align_data = get_align_model(detected_lang)
-            if align_data and result.get("segments"):
-                print("[Worker] Ejecutando alineación fonética wav2vec2...")
-                model_a, metadata = align_data
-                result = whisperx.align(
-                    result["segments"],
-                    model_a,
-                    metadata,
-                    audio,
-                    device=DEVICE,
-                    return_char_alignments=False
-                )
-                print("[Worker] Alineación fonética completada.")
-
-            # ── 4. Diarización de Oradores con Pyannote 3.1 ──
+            model = get_whisper_model()
             diar_pipe = get_diarization_pipeline(hf_token)
+
+            raw_segments = []
+            detected_lang = "es"
+
             if diar_pipe:
-                print("[Worker] Ejecutando diarización de oradores con Pyannote...")
+                print("[Worker] 1. Ejecutando diarización de oradores con Pyannote...")
                 kwargs = {}
                 if min_speakers:
                     kwargs["min_speakers"] = int(min_speakers)
                 if max_speakers:
                     kwargs["max_speakers"] = int(max_speakers)
 
-                diarize_segments = diar_pipe(audio, **kwargs)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                print("[Worker] Diarización y asignación de oradores completada.")
+                diarize_df = diar_pipe(audio, **kwargs)
+
+                # Agrupar intervenciones contiguas del mismo orador si la pausa es menor a 0.8s
+                merged_turns = []
+                for _, row in diarize_df.iterrows():
+                    spk = str(row["speaker"])
+                    st = float(row["start"])
+                    en = float(row["end"])
+                    if merged_turns and merged_turns[-1]["speaker"] == spk and (st - merged_turns[-1]["end"]) < 0.8:
+                        merged_turns[-1]["end"] = en
+                    else:
+                        merged_turns.append({"speaker": spk, "start": st, "end": en})
+
+                print(f"[Worker] Diarización completada: {len(merged_turns)} turnos de orador identificados.")
+                print("[Worker] 2. Transcribiendo turnos con detección dinámica de idioma (¡cero traducciones forzadas!)...")
+
+                sr = 16000
+                detected_languages = []
+                for t in merged_turns:
+                    st_idx = int(t["start"] * sr)
+                    en_idx = int(t["end"] * sr)
+                    if en_idx - st_idx < sr * 0.4:
+                        continue
+                    turn_audio = audio[st_idx:en_idx]
+
+                    # Detectar el idioma específico de este turno (en / es)
+                    lang, prob, _ = model.detect_language(turn_audio)
+                    detected_languages.append(lang)
+
+                    segs, _ = model.transcribe(
+                        turn_audio,
+                        language=lang,
+                        beam_size=5,
+                        word_timestamps=True,
+                        condition_on_previous_text=False
+                    )
+
+                    t_start = t["start"]
+                    for s in segs:
+                        s_text = s.text.strip()
+                        if not s_text:
+                            continue
+                        seg_words = []
+                        if hasattr(s, "words") and s.words:
+                            for w in s.words:
+                                w_text = w.word.strip()
+                                if not w_text:
+                                    continue
+                                seg_words.append({
+                                    "word": w_text,
+                                    "start": round(float(t_start + w.start), 2),
+                                    "end": round(float(t_start + w.end), 2),
+                                    "speaker": t["speaker"],
+                                    "score": getattr(w, "probability", 1.0)
+                                })
+                        raw_segments.append({
+                            "start": round(float(t_start + s.start), 2),
+                            "end": round(float(t_start + s.end), 2),
+                            "text": s_text,
+                            "speaker": t["speaker"],
+                            "words": seg_words,
+                            "language": lang
+                        })
+
+                if detected_languages:
+                    from collections import Counter
+                    detected_lang = Counter(detected_languages).most_common(1)[0][0]
+
             else:
-                print("[Worker] Sin HF Token para Pyannote: asignando orador por defecto SPEAKER_00.")
-                for seg in result.get("segments", []):
-                    seg["speaker"] = "SPEAKER_00"
+                print("[Worker] Sin HF Token para Pyannote: transcribiendo con detección dinámica...")
+                segs, info = model.transcribe(
+                    wav_path,
+                    beam_size=5,
+                    word_timestamps=True,
+                    multilingual=True,
+                    condition_on_previous_text=False,
+                    vad_filter=True
+                )
+                detected_lang = info.language or "es"
+                for s in segs:
+                    s_text = s.text.strip()
+                    if not s_text:
+                        continue
+                    seg_words = []
+                    if hasattr(s, "words") and s.words:
+                        for w in s.words:
+                            w_text = w.word.strip()
+                            if not w_text:
+                                continue
+                            seg_words.append({
+                                "word": w_text,
+                                "start": round(float(w.start), 2),
+                                "end": round(float(w.end), 2),
+                                "speaker": "SPEAKER_00",
+                                "score": getattr(w, "probability", 1.0)
+                            })
+                    raw_segments.append({
+                        "start": round(float(s.start), 2),
+                        "end": round(float(s.end), 2),
+                        "text": s_text,
+                        "speaker": "SPEAKER_00",
+                        "words": seg_words,
+                        "language": detected_lang
+                    })
+
+            # Ordenar segmentos cronológicamente
+            raw_segments.sort(key=lambda x: x["start"])
 
         finally:
             if os.path.exists(wav_path):
                 os.remove(wav_path)
 
-        # ── 5. Formato compatible con TranscriberStudio Pro (Pausas ... y [os]) ──
+        # ── 3. Formato compatible con TranscriberStudio Pro (Pausas ... y [os]) ──
         out_segments = []
-        raw_segments = result.get("segments", [])
 
         for s_idx, seg in enumerate(raw_segments):
             seg_text = seg.get("text", "").strip()
@@ -276,21 +343,7 @@ async def transcribe(
             spk = seg.get("speaker") or "SPEAKER_00"
             s_start = round(float(seg.get("start", 0.0)), 2)
             s_end = round(float(seg.get("end", s_start + 0.5)), 2)
-
-            seg_words = []
-            for w in seg.get("words", []):
-                w_text = w.get("word", "").strip()
-                if not w_text:
-                    continue
-                w_s = w.get("start")
-                w_e = w.get("end")
-                seg_words.append({
-                    "word": w_text,
-                    "start": round(float(w_s), 2) if w_s is not None else s_start,
-                    "end": round(float(w_e), 2) if w_e is not None else s_end,
-                    "speaker": w.get("speaker") or spk,
-                    "score": w.get("score", 1.0)
-                })
+            seg_words = seg.get("words", [])
 
             # Notación de pausas ≥ 1.2s
             annotated_words = []
@@ -322,7 +375,8 @@ async def transcribe(
                 "end": s_end,
                 "text": computed_text,
                 "speaker": spk,
-                "words": seg_words
+                "words": seg_words,
+                "language": seg.get("language")
             })
 
         if torch.cuda.is_available():
