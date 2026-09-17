@@ -53,6 +53,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 import whisperx
+from whisperx.diarize import DiarizationPipeline
 from typing import Optional
 
 app = FastAPI(title="TranscriberStudio Remote GPU Worker")
@@ -97,8 +98,8 @@ def get_diarization_pipeline(hf_token: str = None):
     if diarize_pipeline is None:
         print("[Worker] Cargando WhisperX DiarizationPipeline (Pyannote)...")
         try:
-            diarize_pipeline = whisperx.DiarizationPipeline(
-                use_auth_token=token,
+            diarize_pipeline = DiarizationPipeline(
+                token=token,
                 device=DEVICE
             )
         except Exception as e:
