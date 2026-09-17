@@ -31,6 +31,7 @@ class TranscriptionJob(models.Model):
 class RunPodConfig(models.Model):
     """
     Configuración dinámica persistente del Pod y túnel SSH para RunPod.
+    Incluye campos de aprovisionamiento automático para el flujo 1-clic.
     """
     runpod_api_key = models.CharField(max_length=255, blank=True, default='')
     pod_id = models.CharField(max_length=100, blank=True, default='')
@@ -40,6 +41,17 @@ class RunPodConfig(models.Model):
     hf_token = models.CharField(max_length=255, blank=True, default='')
     local_proxy_port = models.IntegerField(default=8005)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # ── Campos de Aprovisionamiento Automático 1-clic ──
+    # Pod creado automáticamente por el sistema (distinto de pod_id manual)
+    provisioned_pod_id = models.CharField(max_length=100, blank=True, default='')
+    # Estado del proceso de aprovisionamiento en curso
+    # idle | provisioning | connecting | ready | error
+    provision_status = models.CharField(max_length=50, default='idle')
+    # GPU seleccionada durante el aprovisionamiento automático
+    provision_gpu_info = models.JSONField(default=dict, blank=True)
+    # Log de eventos del aprovisionamiento en tiempo real
+    provision_logs = models.JSONField(default=list, blank=True)
 
     class Meta:
         verbose_name = "RunPod Configuration"

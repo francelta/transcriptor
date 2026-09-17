@@ -1,8 +1,8 @@
 from django.urls import path
 from .views import (
-    TranscribeAudioView, 
-    JobDetailView, 
-    SaveTranscriptView, 
+    TranscribeAudioView,
+    JobDetailView,
+    SaveTranscriptView,
     ExportDocxView,
     JobLogsStreamView,
     CancelJobView,
@@ -13,7 +13,10 @@ from .views import (
     WorkerHealthView,
     WorkerConnectView,
     WorkerDisconnectView,
-    PodStatusView
+    PodStatusView,
+    PodProvisionView,
+    PodProvisionEventsView,
+    PodTerminateView,
 )
 
 
@@ -30,10 +33,15 @@ urlpatterns = [
     # Endpoints de Worker Remoto RunPod / Túnel SSH
     path('pod/status/', PodStatusView.as_view(), name='pod-status'),
     path('pod/connect/', WorkerConnectView.as_view(), name='pod-connect'),
+
+    # ── Aprovisionamiento Automático 1-clic ──────────────────────────────────
+    path('pod/provision/', PodProvisionView.as_view(), name='pod-provision'),
+    path('pod/provision/events/', PodProvisionEventsView.as_view(), name='pod-provision-events'),
+    path('pod/terminate/', PodTerminateView.as_view(), name='pod-terminate'),
+
     path('worker/config/', WorkerConfigView.as_view(), name='worker-config'),
     path('worker/detect/', WorkerDetectView.as_view(), name='worker-detect'),
     path('worker/health/', WorkerHealthView.as_view(), name='worker-health'),
     path('worker/connect/', WorkerConnectView.as_view(), name='worker-connect'),
     path('worker/disconnect/', WorkerDisconnectView.as_view(), name='worker-disconnect'),
 ]
-

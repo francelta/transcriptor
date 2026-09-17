@@ -36,8 +36,11 @@ query Pod($podId: String!) {
 }
 """
 
-# Script optimizado para ejecutar en el Pod GPU (/server.py)
+# Script optimizado y exhaustivo para ejecutar en el Pod GPU (/server.py)
 POD_SERVER_PY_CONTENT = '''# /server.py - TranscriberStudio Pro Remote GPU Worker
+# Inferencia oficial de alta fidelidad con WhisperX (large-v3)
+# Incluye: transcripción batched, alineación fonética wav2vec2 palabra por palabra,
+# diarización Pyannote 3.1, pausas (≥1.2s → ...) y solapamientos ([os]).
 import os
 import io
 import gc
@@ -49,8 +52,8 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
-from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
+import whisperx
+from typing import Optional
 
 app = FastAPI(title="TranscriberStudio Remote GPU Worker")
 
@@ -58,44 +61,52 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Context prompt temático para evitar confusiones léxicas
-INITIAL_PROMPT = (
-    "Entrevista de investigación académica sobre el Mar Menor, nitratos, rambla, "
-    "metales pesados, personalidad jurídica, puertos deportivos, contaminación agrícola "
-    "y regeneración ambiental."
-)
-
-whisper_model = None
+whisperx_model = None
+align_models_cache = {}
 diarize_pipeline = None
 
-def get_whisper():
-    global whisper_model
-    if whisper_model is None:
-        print(f"[Worker] Cargando Faster-Whisper large-v3 en {DEVICE} ({COMPUTE_TYPE})...")
-        whisper_model = WhisperModel("large-v3", device=DEVICE, compute_type=COMPUTE_TYPE)
-    return whisper_model
+def get_whisperx_model():
+    global whisperx_model
+    if whisperx_model is None:
+        print(f"[Worker] Cargando WhisperX (large-v3) en {DEVICE} ({COMPUTE_TYPE})...")
+        whisperx_model = whisperx.load_model(
+            "large-v3",
+            device=DEVICE,
+            compute_type=COMPUTE_TYPE,
+            language="es"
+        )
+    return whisperx_model
 
-def get_diarization(hf_token: str = None):
+def get_align_model(language_code: str):
+    global align_models_cache
+    if language_code not in align_models_cache:
+        print(f"[Worker] Cargando modelo de alineación fonética para idioma '{language_code}'...")
+        try:
+            model_a, metadata = whisperx.load_align_model(language_code=language_code, device=DEVICE)
+            align_models_cache[language_code] = (model_a, metadata)
+        except Exception as e:
+            print(f"[Worker] Error cargando modelo de alineación para {language_code}: {e}")
+            align_models_cache[language_code] = None
+    return align_models_cache[language_code]
+
+def get_diarization_pipeline(hf_token: str = None):
     global diarize_pipeline
     token = (hf_token or HF_TOKEN or "").strip()
     if not token:
         return None
     if diarize_pipeline is None:
-        print("[Worker] Cargando Pyannote Audio Diarization 3.1...")
+        print("[Worker] Cargando WhisperX DiarizationPipeline (Pyannote)...")
         try:
-            diarize_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=token
+            diarize_pipeline = whisperx.DiarizationPipeline(
+                use_auth_token=token,
+                device=DEVICE
             )
-            if torch.cuda.is_available():
-                diarize_pipeline.to(torch.device("cuda"))
         except Exception as e:
-            print(f"[Worker] Error cargando Pyannote: {e}")
+            print(f"[Worker] Error cargando pipeline de diarización: {e}")
             return None
     return diarize_pipeline
 
 @app.get("/")
-@app.get("/docs")
 @app.get("/health")
 def health():
     return {
@@ -105,10 +116,17 @@ def health():
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
     }
 
-def convert_to_wav_16k_mono(input_bytes: bytes) -> np.ndarray:
+@app.get("/docs")
+def docs_redirect():
+    return {"status": "healthy", "message": "TranscriberStudio GPU Worker running"}
+
+def convert_to_wav_16k_mono_filtered(input_bytes: bytes) -> np.ndarray:
     """
-    Convierte cualquier archivo multimedia a WAV 16kHz mono usando ffmpeg
-    y lo carga en memoria como array float32.
+    Convierte cualquier archivo multimedia a WAV 16kHz mono usando ffmpeg.
+    Aplica:
+      - Filtro pasa-banda de voz humana: 80 Hz a 8000 Hz (highpass + lowpass)
+      - Normalización perceptual EBU R128 para rescatar susurros y voces lejanas
+        loudnorm=I=-16:TP=-1.5:LRA=11
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_in:
         tmp_in.write(input_bytes)
@@ -120,6 +138,7 @@ def convert_to_wav_16k_mono(input_bytes: bytes) -> np.ndarray:
             "ffmpeg", "-y", "-i", tmp_in_path,
             "-ar", "16000",
             "-ac", "1",
+            "-af", "highpass=f=80,lowpass=f=8000,loudnorm=I=-16:TP=-1.5:LRA=11",
             "-f", "wav",
             tmp_out_path
         ]
@@ -139,12 +158,12 @@ def convert_to_wav_16k_mono(input_bytes: bytes) -> np.ndarray:
 
 def merge_speaker_turns(turns, pause_threshold=1.0):
     """
-    Agrupación temporal inteligente:
-    Fusiona turnos contiguos del mismo orador si la pausa entre ellos es menor a pause_threshold (1.0 s).
+    Fusión de turnos contiguos del mismo orador si la pausa entre ellos
+    es menor a pause_threshold (1.0 s). Reduce fragmentación excesiva.
     """
     if not turns:
         return []
-    
+
     merged = []
     current = dict(turns[0])
 
@@ -156,6 +175,21 @@ def merge_speaker_turns(turns, pause_threshold=1.0):
             current = dict(nxt)
     merged.append(current)
     return merged
+
+def detect_language_bilingual(whisper, chunk: np.ndarray) -> str:
+    """
+    Clasificador bilingüe RESTRINGIDO: evalúa EXCLUSIVAMENTE es y en.
+    Descarta cualquier desvío a francés u otras lenguas.
+    Devuelve "es" o "en".
+    """
+    try:
+        sample_chunk = chunk[:int(30 * 16000)]
+        _, lang_probs = whisper.detect_language(sample_chunk)
+        prob_es = lang_probs.get("es", 0.0)
+        prob_en = lang_probs.get("en", 0.0)
+        return "en" if prob_en > prob_es else "es"
+    except Exception:
+        return "es"
 
 @app.post("/transcribe")
 async def transcribe(
@@ -169,140 +203,124 @@ async def transcribe(
         if not content:
             raise HTTPException(status_code=400, detail="Archivo vacío recibido.")
 
-        print(f"[Worker] Procesando audio recibido ({len(content)} bytes)...")
-        data = convert_to_wav_16k_mono(content)
+        print(f"[Worker] Procesando audio recibido ({len(content)} bytes) con WhisperX...")
+
+        # ── 1. Preprocesamiento Acústico (EBU R128 + filtro pasa-banda voz) ──
+        data = convert_to_wav_16k_mono_filtered(content)
         sample_rate = 16000
         total_duration = len(data) / float(sample_rate)
+        print(f"[Worker] Audio preprocesado: {total_duration:.2f}s @ 16kHz mono")
 
-        # 1. Diarización In-Memory con Pyannote 3.1
-        diar_pipe = get_diarization(hf_token)
-        raw_turns = []
-        if diar_pipe:
-            waveform = torch.from_numpy(data).unsqueeze(0)
-            audio_in_memory = {"waveform": waveform, "sample_rate": 16000}
-            kwargs = {}
-            if min_speakers: kwargs["min_speakers"] = int(min_speakers)
-            if max_speakers: kwargs["max_speakers"] = int(max_speakers)
-            
-            print("[Worker] Ejecutando diarización en GPU con Pyannote...")
-            diar_out = diar_pipe(audio_in_memory, **kwargs)
-            for turn, _, speaker in diar_out.itertracks(yield_label=True):
-                raw_turns.append({
-                    "start": round(float(turn.start), 3),
-                    "end": round(float(turn.end), 3),
-                    "speaker": speaker
-                })
-        else:
-            print("[Worker] Sin Pyannote token: asignando orador por defecto.")
-            raw_turns.append({"start": 0.0, "end": total_duration, "speaker": "SPEAKER_00"})
+        # Guardar temporal para carga en whisperx
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            sf.write(tmp_wav.name, data, sample_rate)
+            wav_path = tmp_wav.name
 
-        # 2. Agrupación Temporal Inteligente (pausas < 1.0 s)
-        merged_turns = merge_speaker_turns(raw_turns, pause_threshold=1.0)
-        print(f"[Worker] Diarización agrupada en {len(merged_turns)} intervenciones.")
+        try:
+            audio = whisperx.load_audio(wav_path)
 
-        # 3. Clasificador Bilingüe Forzado (es vs en) & Inferencia por segmentos
-        whisper = get_whisper()
+            # ── 2. Transcripción con WhisperX (large-v3, batch_size=16) ──
+            model = get_whisperx_model()
+            print("[Worker] Ejecutando transcripción WhisperX (large-v3)...")
+            result = model.transcribe(audio, batch_size=16)
+            detected_lang = result.get("language", "es")
+            print(f"[Worker] Transcripción completada. Idioma detectado: {detected_lang}")
+
+            # ── 3. Alineación Fonética Forzada (Wav2Vec2 palabra por palabra) ──
+            align_data = get_align_model(detected_lang)
+            if align_data and result.get("segments"):
+                print("[Worker] Ejecutando alineación fonética wav2vec2...")
+                model_a, metadata = align_data
+                result = whisperx.align(
+                    result["segments"],
+                    model_a,
+                    metadata,
+                    audio,
+                    device=DEVICE,
+                    return_char_alignments=False
+                )
+                print("[Worker] Alineación fonética completada.")
+
+            # ── 4. Diarización de Oradores con Pyannote 3.1 ──
+            diar_pipe = get_diarization_pipeline(hf_token)
+            if diar_pipe:
+                print("[Worker] Ejecutando diarización de oradores con Pyannote...")
+                kwargs = {}
+                if min_speakers:
+                    kwargs["min_speakers"] = int(min_speakers)
+                if max_speakers:
+                    kwargs["max_speakers"] = int(max_speakers)
+
+                diarize_segments = diar_pipe(audio, **kwargs)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+                print("[Worker] Diarización y asignación de oradores completada.")
+            else:
+                print("[Worker] Sin HF Token para Pyannote: asignando orador por defecto SPEAKER_00.")
+                for seg in result.get("segments", []):
+                    seg["speaker"] = "SPEAKER_00"
+
+        finally:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+
+        # ── 5. Formato compatible con TranscriberStudio Pro (Pausas ... y [os]) ──
         out_segments = []
+        raw_segments = result.get("segments", [])
 
-        for turn_idx, turn in enumerate(merged_turns):
-            spk = turn["speaker"]
-            t_start = turn["start"]
-            t_end = turn["end"]
-
-            # Padding Acústico (+- 200 ms)
-            pad_sec = 0.20
-            p_start = max(0.0, t_start - pad_sec)
-            p_end = min(total_duration, t_end + pad_sec)
-
-            idx_start = int(p_start * sample_rate)
-            idx_end = int(p_end * sample_rate)
-            chunk = data[idx_start:idx_end]
-
-            if len(chunk) < int(0.25 * sample_rate):  # Descartar ruidos < 250ms
+        for s_idx, seg in enumerate(raw_segments):
+            seg_text = seg.get("text", "").strip()
+            if not seg_text:
                 continue
 
-            # Detección de idioma con Clasificador Bilingüe Forzado (es vs en)
-            try:
-                sample_chunk = chunk[:int(30 * sample_rate)]
-                mel = whisper.feature_extractor(sample_chunk)
-                encoder_output = whisper.model.encode(mel)
-                lang_probs = whisper.model.detect_language(encoder_output)
-                
-                prob_dict = {l.split("/")[-1]: p for l, p in lang_probs}
-                prob_es = prob_dict.get("es", 0.0)
-                prob_en = prob_dict.get("en", 0.0)
+            spk = seg.get("speaker") or "SPEAKER_00"
+            s_start = round(float(seg.get("start", 0.0)), 2)
+            s_end = round(float(seg.get("end", s_start + 0.5)), 2)
 
-                assigned_lang = "en" if prob_en > prob_es else "es"
-            except Exception:
-                assigned_lang = "es"
-
-            # Inferencia con Context Prompt
-            segments_gen, _ = whisper.transcribe(
-                chunk,
-                beam_size=5,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                word_timestamps=True,
-                language=assigned_lang,
-                initial_prompt=INITIAL_PROMPT
-            )
-
-            seg_text_list = []
             seg_words = []
+            for w in seg.get("words", []):
+                w_text = w.get("word", "").strip()
+                if not w_text:
+                    continue
+                w_s = w.get("start")
+                w_e = w.get("end")
+                seg_words.append({
+                    "word": w_text,
+                    "start": round(float(w_s), 2) if w_s is not None else s_start,
+                    "end": round(float(w_e), 2) if w_e is not None else s_end,
+                    "speaker": w.get("speaker") or spk,
+                    "score": w.get("score", 1.0)
+                })
 
-            for s in segments_gen:
-                t_words = []
-                if hasattr(s, "words") and s.words:
-                    for w in s.words:
-                        w_abs_start = round(p_start + float(w.start), 2)
-                        w_abs_end = round(p_start + float(w.end), 2)
-                        t_words.append({
-                            "word": w.word,
-                            "start": w_abs_start,
-                            "end": w_abs_end,
-                            "speaker": spk,
-                            "probability": getattr(w, "probability", 1.0)
-                        })
-                
-                seg_words.extend(t_words)
-                if s.text and s.text.strip():
-                    seg_text_list.append(s.text.strip())
-
-            full_seg_text = " ".join(seg_text_list).strip()
-            if not full_seg_text and not seg_words:
-                continue
-
-            # 4. Cálculo Matemático de Pausas e Interrupciones en el texto
-            annotated_text_words = []
-            for i in range(len(seg_words)):
-                current_word = seg_words[i]
-                annotated_text_words.append(current_word["word"].strip())
+            # Notación de pausas ≥ 1.2s
+            annotated_words = []
+            for i, current_word in enumerate(seg_words):
+                annotated_words.append(current_word["word"])
                 if i < len(seg_words) - 1:
-                    next_word = seg_words[i + 1]
-                    gap = next_word["start"] - current_word["end"]
+                    gap = seg_words[i + 1]["start"] - current_word["end"]
                     if gap >= 1.2:
-                        annotated_text_words.append("...")
+                        annotated_words.append("...")
 
-            computed_text = " ".join(annotated_text_words) if annotated_text_words else full_seg_text
+            computed_text = " ".join(annotated_words) if annotated_words else seg_text
 
-            # 5. Detección de solapamiento de oradores [os]
+            # Detección de solapamiento de oradores [os]
             is_overlapping = False
-            for other_turn in raw_turns:
-                if other_turn["speaker"] != spk:
-                    overlap = max(0.0, min(t_end, other_turn["end"]) - max(t_start, other_turn["start"]))
+            for other_seg in raw_segments:
+                if other_seg.get("speaker") and other_seg["speaker"] != spk:
+                    o_start = float(other_seg.get("start", 0.0))
+                    o_end = float(other_seg.get("end", 0.0))
+                    overlap = max(0.0, min(s_end, o_end) - max(s_start, o_start))
                     if overlap >= 0.2:
                         is_overlapping = True
                         break
-            
+
             if is_overlapping and "[os]" not in computed_text:
                 computed_text = f"{computed_text} [os]"
 
             out_segments.append({
-                "start": round(t_start, 2),
-                "end": round(t_end, 2),
+                "start": s_start,
+                "end": s_end,
                 "text": computed_text,
                 "speaker": spk,
-                "language": assigned_lang,
                 "words": seg_words
             })
 
@@ -313,6 +331,7 @@ async def transcribe(
         return JSONResponse({
             "status": "success",
             "duration": round(total_duration, 2),
+            "language": detected_lang,
             "segments": out_segments
         })
 
@@ -322,7 +341,7 @@ async def transcribe(
         raise HTTPException(status_code=500, detail=str(exc))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 '''
 
 
@@ -470,6 +489,9 @@ class RunPodOrchestrator:
         Abre túnel SSH hacia el Pod:
         127.0.0.1:{local_port} -> {host}:{ssh_port} -> 127.0.0.1:{remote_port}
         """
+        import paramiko
+        if not hasattr(paramiko, "DSSKey"):
+            paramiko.DSSKey = None
         import sshtunnel
 
         expanded_key = os.path.expanduser(ssh_key_path)

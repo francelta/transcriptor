@@ -241,6 +241,9 @@ class PodTunnelManager:
         Abre el túnel SSH hacia el pod:
         127.0.0.1:{local_port} -> {host}:{ssh_port} -> 127.0.0.1:{remote_port}
         """
+        import paramiko
+        if not hasattr(paramiko, "DSSKey"):
+            paramiko.DSSKey = None
         import sshtunnel
 
         expanded_key_path = os.path.expanduser(ssh_key_path)

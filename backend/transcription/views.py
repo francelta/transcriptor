@@ -881,3 +881,540 @@ class WorkerDisconnectView(APIView):
         return Response({"status": "disconnected", "message": "Túnel SSH detenido."}, status=status.HTTP_200_OK)
 
 
+# =====================================================================
+# APROVISIONAMIENTO AUTOMÁTICO 1-CLIC: PROVISION / EVENTS / TERMINATE
+# =====================================================================
+
+# Estado global del aprovisionamiento (en memoria, accesible entre vistas)
+_provision_lock = threading.Lock()
+# Cola en memoria: canal de comunicación entre el hilo de aprovisionamiento y el SSE
+# Evita el problema de visibilidad SQLite entre hilos en Django dev server
+import queue as _queue_module
+_provision_queue: _queue_module.Queue = _queue_module.Queue()
+_provision_active: bool = False  # Flag para saber si hay un aprovisionamiento en curso
+
+def _run_provision_flow(config_id: int, api_key: str, hf_token: str, ssh_key_path: str, local_port: int):
+    """
+    Ejecuta el flujo completo de aprovisionamiento en un thread de background.
+    Comunica el progreso mediante _provision_queue (en memoria) para el SSE,
+    y escribe el estado final en la DB.
+    """
+    global _provision_active
+    from django.db import connection as _db_connection
+    # Cerrar conexión heredada del proceso padre para evitar stale SQLite en el hilo
+    _db_connection.close()
+
+    from .models import RunPodConfig
+    from .services.runpod_service import provision_pod, poll_pod_until_running
+    from .services.runpod_orchestrator import RunPodOrchestrator, POD_SERVER_PY_CONTENT
+
+    def push_log(step: str, message: str, level: str = "info"):
+        """Emite un log al SSE (via queue) Y lo persiste en DB."""
+        entry = {
+            "step": step,
+            "message": message,
+            "level": level,
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        }
+        # 1. Emitir a la queue (SSE la lee inmediatamente)
+        _provision_queue.put(entry)
+        # 2. Persistir en DB (para recuperación tras recarga)
+        try:
+            cfg = RunPodConfig.objects.get(pk=config_id)
+            logs = list(cfg.provision_logs or [])
+            logs.append(entry)
+            cfg.provision_logs = logs
+            cfg.save(update_fields=["provision_logs"])
+        except Exception as ex:
+            logger.warning(f"push_log DB write failed (non-critical): {ex}")
+
+    def set_status(s: str):
+        try:
+            RunPodConfig.objects.filter(pk=config_id).update(provision_status=s)
+        except Exception as ex:
+            logger.warning(f"set_status DB write failed: {ex}")
+        # Emitir marcador de estado a la queue para que el SSE lo detecte
+        _provision_queue.put({"__status__": s})
+
+    try:
+        # ── PASO 1: Buscar todas las GPUs asequibles (lista priorizada) ──────
+        set_status("provisioning")
+        push_log("searching_gpu", "🔍 Buscando GPUs disponibles por debajo de 0.40 $/h en RunPod...", "info")
+
+        from .services.runpod_service import find_all_affordable_gpus
+        gpu_candidates = find_all_affordable_gpus(api_key)
+
+        if not gpu_candidates:
+            raise RuntimeError(
+                "No hay ninguna GPU On-Demand disponible por debajo de 0.40 $/h en RunPod. "
+                "Verifica la disponibilidad o ajusta el límite de precio."
+            )
+
+        gpu_names = ", ".join(f"{g['displayName']} ({g['price']:.3f}$/h)" for g in gpu_candidates)
+        push_log(
+            "searching_gpu",
+            f"✅ {len(gpu_candidates)} GPU(s) candidata(s) encontrada(s): {gpu_names}",
+            "success"
+        )
+
+        # ── PASO 2: Intentar crear pod con cada GPU por orden de prioridad ──
+        gpu_info = None
+        pod_id = None
+        last_deploy_error = None
+
+        for candidate in gpu_candidates:
+            push_log(
+                "creating_pod",
+                f"🚀 Intentando {candidate['displayName']} @ {candidate['price']:.3f} $/h "
+                f"({candidate['memoryInGb']} GB VRAM)...",
+                "info"
+            )
+            try:
+                pod_id = provision_pod(api_key, candidate["id"])
+                gpu_info = candidate
+                push_log("creating_pod", f"✅ Pod creado: {pod_id} con {gpu_info['displayName']}", "success")
+                break  # Éxito — salir del bucle
+            except RuntimeError as deploy_err:
+                last_deploy_error = str(deploy_err)
+                err_short = last_deploy_error[:120]
+                push_log(
+                    "creating_pod",
+                    f"⚠️ {candidate['displayName']} sin instancias libres: {err_short}. Probando siguiente...",
+                    "info"
+                )
+                continue
+
+        if not pod_id or not gpu_info:
+            raise RuntimeError(
+                f"Ninguna GPU tuvo instancias disponibles en este momento. "
+                f"Último error: {last_deploy_error or 'desconocido'}. "
+                "Espera unos minutos y vuelve a intentarlo, o consulta la disponibilidad en RunPod."
+            )
+
+        # Guardar info de GPU y pod_id
+        RunPodConfig.objects.filter(pk=config_id).update(
+            provision_gpu_info=gpu_info,
+            provisioned_pod_id=pod_id,
+            pod_id=pod_id
+        )
+
+        # ── PASO 3: Esperar IP pública (polling cada 3s) ──────────────────────
+        push_log("waiting_ip", f"⏳ Esperando que el pod {pod_id} alcance estado RUNNING (polling 3s)...", "info")
+        pod_info = poll_pod_until_running(api_key, pod_id, max_retries=80, interval_seconds=3.0)
+
+        pod_host = pod_info["pod_host"]
+        pod_ssh_port = pod_info["pod_ssh_port"]
+        push_log("waiting_ip", f"✅ IP pública obtenida: {pod_host}:{pod_ssh_port}", "success")
+
+        # Persistir host y puerto SSH
+        RunPodConfig.objects.filter(pk=config_id).update(
+            pod_host=pod_host,
+            pod_ssh_port=pod_ssh_port
+        )
+
+        # ── PASOS 4-7: Aprovisionamiento vía SSH (Paramiko) ──────────────────
+        push_log("ssh_connect", f"🔗 Conectando por SSH a root@{pod_host}:{pod_ssh_port}...", "info")
+
+        import paramiko, io as _io
+
+        expanded_key = os.path.expanduser(ssh_key_path)
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        # Reintentos de SSH (el pod puede tardar en arrancar el servicio)
+        ssh_connected = False
+        for ssh_attempt in range(12):
+            try:
+                ssh.connect(
+                    hostname=pod_host,
+                    port=int(pod_ssh_port),
+                    username="root",
+                    key_filename=expanded_key,
+                    timeout=20,
+                    banner_timeout=25,
+                )
+                ssh_connected = True
+                if ssh.get_transport():
+                    ssh.get_transport().set_keepalive(15)
+                break
+            except Exception as ssh_err:
+                logger.warning(f"SSH intento {ssh_attempt+1}/12: {ssh_err}")
+                time.sleep(5)
+
+        if not ssh_connected:
+            raise RuntimeError(
+                f"No se pudo conectar por SSH a root@{pod_host}:{pod_ssh_port} tras 12 intentos. "
+                "Verifica que la clave pública está registrada en RunPod Settings → SSH Public Keys."
+            )
+
+        push_log("ssh_connect", "✅ Conexión SSH establecida con éxito.", "success")
+
+        def exec_cmd(cmd, timeout=300):
+            stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+            exit_status = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+            return exit_status, out, err
+
+        # ── PASO 5: Instalar dependencias del sistema ─────────────────────────
+        push_log("installing_deps", "📦 Verificando e instalando dependencias del sistema (ffmpeg, tmux, libsndfile1)...", "info")
+        st, _, _ = exec_cmd("which tmux && which ffmpeg && which curl")
+        if st != 0:
+            exec_cmd(
+                "apt-get update -qq && apt-get install -y -qq ffmpeg libsndfile1 tmux curl",
+                timeout=180
+            )
+
+        # Verificar dependencias Python (WhisperX oficial + FastAPI)
+        st, _, _ = exec_cmd("python3 -c 'import whisperx, soundfile, fastapi, uvicorn'")
+        if st != 0:
+            push_log("installing_deps", "📦 Instalando librerías Python (whisperx, pyannote.audio, fastapi, uvicorn, soundfile)...", "info")
+            exec_cmd(
+                "pip install --no-cache-dir whisperx fastapi uvicorn soundfile python-multipart scipy",
+                timeout=420
+            )
+        push_log("installing_deps", "✅ Dependencias del sistema y Python verificadas.", "success")
+
+        # ── PASO 6: Subir /server.py vía SFTP ────────────────────────────────
+        push_log("uploading_script", "📤 Subiendo script de inferencia /server.py al pod...", "info")
+        # Asegurar que el transporte SSH sigue vivo tras descargas largas
+        if not ssh.get_transport() or not ssh.get_transport().is_active():
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                hostname=pod_host,
+                port=int(pod_ssh_port),
+                username="root",
+                key_filename=expanded_key,
+                timeout=20,
+            )
+            if ssh.get_transport():
+                ssh.get_transport().set_keepalive(15)
+
+        sftp = ssh.open_sftp()
+        with sftp.file("/server.py", "w") as remote_f:
+            remote_f.write(POD_SERVER_PY_CONTENT)
+        sftp.close()
+        push_log("uploading_script", "✅ /server.py subido correctamente.", "success")
+
+        # ── PASO 7: Iniciar worker en sesión tmux ─────────────────────────────
+        push_log("starting_worker", "⚙️ Lanzando servidor GPU en sesión tmux 'worker'...", "info")
+        exec_cmd("tmux kill-session -t worker 2>/dev/null || true")
+        token_env = f"export HF_TOKEN='{hf_token.strip()}';" if hf_token else ""
+        launch_cmd = (
+            f"tmux new-session -d -s worker "
+            f"'{token_env} python3 /server.py > /tmp/server.log 2>&1'"
+        )
+        exec_cmd(launch_cmd)
+        ssh.close()
+        push_log("starting_worker", "✅ Worker GPU lanzado en sesión tmux 'worker'.", "success")
+
+        # ── PASO 8: Abrir túnel SSH ───────────────────────────────────────────
+        push_log("opening_tunnel", f"🔒 Abriendo túnel SSH localhost:{local_port} → pod:8000...", "info")
+        orchestrator = RunPodOrchestrator()
+        orchestrator.start_tunnel(pod_host, pod_ssh_port, ssh_key_path, local_port=local_port, remote_port=8000)
+        push_log("opening_tunnel", f"✅ Túnel SSH activo en localhost:{local_port}.", "success")
+
+        # ── PASO 9: Healthcheck (polling hasta 200 OK) ────────────────────────
+        push_log("healthcheck", f"🏥 Verificando que el worker responde en localhost:{local_port}/health...", "info")
+        worker_ready = False
+        for hc_attempt in range(30):  # Hasta 90 segundos
+            time.sleep(3)
+            try:
+                r = requests.get(f"http://127.0.0.1:{local_port}/health", timeout=4)
+                if r.status_code == 200:
+                    worker_ready = True
+                    break
+            except Exception:
+                pass
+
+        if not worker_ready:
+            raise RuntimeError(
+                f"El worker GPU no respondió 200 OK en localhost:{local_port}/health tras 90 segundos. "
+                "Revisa /tmp/server.log en el pod para más detalles."
+            )
+
+        # ── PASO 10: Listo ────────────────────────────────────────────────────
+        set_status("ready")
+        push_log(
+            "ready",
+            f"🎉 ¡GPU lista para transcribir! Worker responde en localhost:{local_port} "
+            f"({gpu_info['displayName']} @ {gpu_info['price']:.3f} $/h).",
+            "success"
+        )
+
+    except Exception as exc:
+        logger.error(f"Error en flujo de aprovisionamiento: {exc}")
+        import traceback
+        traceback.print_exc()
+        try:
+            push_log("error", f"❌ Error: {exc}", "error")
+            set_status("error")
+        except Exception:
+            pass
+    finally:
+        _provision_active = False
+
+
+class PodProvisionView(APIView):
+    """
+    POST /api/pod/provision/
+    Lanza el flujo completo de aprovisionamiento automático 1-clic en un thread de background:
+    busca GPU económica → crea pod → espera IP → SSH → instala deps → sube server.py → tmux → túnel → healthcheck.
+    Responde inmediatamente con 202 Accepted. El progreso se puede seguir via SSE en /api/pod/provision/events/
+    """
+    def post(self, request):
+        global _provision_active
+        from .models import RunPodConfig
+
+        config = RunPodConfig.get_solo()
+
+        # Verificar que hay API key configurada
+        api_key = (request.data.get("runpod_api_key") or config.runpod_api_key or "").strip()
+        if not api_key:
+            return Response(
+                {"error": "RunPod API Key no configurada. Ve a Configuración → Worker Config y añade tu clave."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Si ya está aprovisionando ACTIVAMENTE (hilo vivo), evitar doble arranque.
+        # Nota: _provision_active se resetea a False cuando el proceso Django reinicia,
+        # evitando que un status "provisioning" antiguo en DB bloquee nuevas solicitudes.
+        if _provision_active and config.provision_status == "provisioning":
+            return Response(
+                {"error": "Ya hay un aprovisionamiento en curso. Espera a que finalice o recarga la página."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        # Si el status estaba atascado en "provisioning" pero no hay hilo activo
+        # (reinicio del servidor), resetearlo para permitir nuevo intento
+        if not _provision_active and config.provision_status == "provisioning":
+            config.provision_status = "error"
+            config.provision_logs = (config.provision_logs or []) + [{
+                "step": "error",
+                "message": "⚠️ Aprovisionamiento anterior interrumpido por reinicio del servidor. Puedes reintentar.",
+                "level": "info",
+                "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            }]
+            config.save(update_fields=["provision_status", "provision_logs"])
+
+        hf_token = (request.data.get("hf_token") or config.hf_token or "").strip()
+        ssh_key_path = (request.data.get("ssh_key_path") or config.ssh_key_path or "~/.ssh/id_rsa").strip()
+        local_port = int(request.data.get("local_proxy_port") or config.local_proxy_port or 8005)
+
+        # Guardar la api_key si viene del request (sin campos manuales)
+        if request.data.get("runpod_api_key"):
+            config.runpod_api_key = api_key
+            config.save(update_fields=["runpod_api_key"])
+
+        # Limpiar queue antes de iniciar (descartar mensajes de runs anteriores)
+        while not _provision_queue.empty():
+            try:
+                _provision_queue.get_nowait()
+            except _queue_module.Empty:
+                break
+
+        config.provision_status = "provisioning"
+        config.provision_logs = []
+        config.provision_gpu_info = {}
+        config.save(update_fields=["provision_status", "provision_logs", "provision_gpu_info"])
+
+        _provision_active = True
+
+        # Lanzar el flujo en background
+        thread = threading.Thread(
+            target=_run_provision_flow,
+            args=(config.id, api_key, hf_token, ssh_key_path, local_port),
+            daemon=True,
+        )
+        thread.start()
+
+        return Response(
+            {
+                "status": "provisioning",
+                "message": "Aprovisionamiento automático iniciado. Sigue el progreso en tiempo real via SSE.",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class PodProvisionEventsView(View):
+    """
+    GET /api/pod/provision/events/
+    Server-Sent Events (SSE). Lee desde _provision_queue (en memoria) para
+    comunicación instantanea con el hilo de aprovisionamiento.
+    Evita el problema de visibilidad SQLite entre hilos en el Django dev server.
+    """
+    def get(self, request):
+        from django.db import connection as _db_conn
+
+        def event_stream():
+            # Leer logs históricos de DB (en caso de recarga / reconexion)
+            try:
+                _db_conn.close()  # Forzar nueva conexión limpia
+                from .models import RunPodConfig
+                cfg = RunPodConfig.objects.get(pk=1)
+                historic_logs = list(cfg.provision_logs or [])
+                current_status = cfg.provision_status
+                gpu_info = cfg.provision_gpu_info or {}
+            except Exception:
+                historic_logs = []
+                current_status = "provisioning"
+                gpu_info = {}
+
+            # Emitir logs históricos (para reconexiones)
+            for entry in historic_logs:
+                payload = json.dumps({
+                    "type": "provision_log",
+                    "step": entry.get("step", ""),
+                    "message": entry.get("message", ""),
+                    "level": entry.get("level", "info"),
+                    "time": entry.get("time", ""),
+                    "provision_status": current_status,
+                    "gpu_info": gpu_info,
+                })
+                yield f"data: {payload}\n\n"
+
+            if current_status in ("ready", "error"):
+                # Ya terminó antes de que llegara el SSE: emitir evento final
+                _db_conn.close()
+                from .models import RunPodConfig
+                try:
+                    cfg = RunPodConfig.objects.get(pk=1)
+                except Exception:
+                    return
+                final_payload = json.dumps({
+                    "type": "provision_complete",
+                    "provision_status": cfg.provision_status,
+                    "pod_host": cfg.pod_host,
+                    "pod_ssh_port": cfg.pod_ssh_port,
+                    "provisioned_pod_id": cfg.provisioned_pod_id,
+                    "gpu_info": cfg.provision_gpu_info or {},
+                })
+                yield f"data: {final_payload}\n\n"
+                return
+
+            # Escuchar la queue en tiempo real (sin poll a DB)
+            max_wait_seconds = 600  # 10 minutos máx
+            deadline = time.time() + max_wait_seconds
+
+            while time.time() < deadline:
+                try:
+                    item = _provision_queue.get(timeout=2.0)
+                except _queue_module.Empty:
+                    # Heartbeat para mantener la conexión viva
+                    yield ": heartbeat\n\n"
+                    continue
+
+                # Marcador de estado (sent by set_status)
+                if "__status__" in item:
+                    new_status = item["__status__"]
+                    if new_status in ("ready", "error"):
+                        # Emitir evento final con datos de DB
+                        time.sleep(0.3)  # Dejar que la DB se actualice
+                        _db_conn.close()
+                        from .models import RunPodConfig
+                        try:
+                            cfg = RunPodConfig.objects.get(pk=1)
+                        except Exception:
+                            break
+                        final_payload = json.dumps({
+                            "type": "provision_complete",
+                            "provision_status": new_status,
+                            "pod_host": cfg.pod_host,
+                            "pod_ssh_port": cfg.pod_ssh_port,
+                            "provisioned_pod_id": cfg.provisioned_pod_id,
+                            "gpu_info": cfg.provision_gpu_info or {},
+                        })
+                        yield f"data: {final_payload}\n\n"
+                        break
+                    continue
+
+                # Entrada de log normal
+                payload = json.dumps({
+                    "type": "provision_log",
+                    "step": item.get("step", ""),
+                    "message": item.get("message", ""),
+                    "level": item.get("level", "info"),
+                    "time": item.get("time", ""),
+                    "provision_status": "provisioning",
+                    "gpu_info": {},
+                })
+                yield f"data: {payload}\n\n"
+
+        response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+        response["Cache-Control"] = "no-cache"
+        response["X-Accel-Buffering"] = "no"
+        response["Connection"] = "keep-alive"
+        return response
+
+
+class PodTerminateView(APIView):
+    """
+    POST /api/pod/terminate/
+    Elimina definitivamente el pod activo en RunPod (provisioned_pod_id o pod_id).
+    Detiene el túnel SSH y resetea el estado de aprovisionamiento.
+    IMPORTANTE: Esta acción CONGELA la facturación de GPU de forma inmediata.
+    """
+    def post(self, request):
+        from .models import RunPodConfig
+        from .services.runpod_service import terminate_pod
+        from .services.runpod_orchestrator import RunPodOrchestrator
+
+        config = RunPodConfig.get_solo()
+        api_key = (config.runpod_api_key or "").strip()
+
+        # Elegir el pod a terminar: primero el aprovisionado automáticamente, luego el manual
+        pod_id = (
+            request.data.get("pod_id")
+            or config.provisioned_pod_id
+            or config.pod_id
+        ).strip()
+
+        if not pod_id:
+            return Response(
+                {"error": "No hay ningún Pod ID configurado para terminar."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not api_key:
+            return Response(
+                {"error": "RunPod API Key no configurada. No se puede terminar el pod."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Detener el túnel SSH primero
+        try:
+            orchestrator = RunPodOrchestrator()
+            orchestrator.stop_tunnel()
+        except Exception as e:
+            logger.warning(f"Error deteniendo túnel SSH antes de terminar pod: {e}")
+
+        # Terminar el pod en RunPod
+        try:
+            terminate_pod(api_key, pod_id)
+        except Exception as exc:
+            return Response(
+                {"error": f"Error terminando el pod {pod_id} en RunPod: {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # Resetear configuración
+        global _provision_active
+        _provision_active = False
+        config.provisioned_pod_id = ""
+        config.pod_host = ""
+        config.pod_ssh_port = 22
+        config.provision_status = "idle"
+        config.provision_logs = []
+        config.provision_gpu_info = {}
+        config.save()
+
+        return Response(
+            {
+                "status": "terminated",
+                "pod_id": pod_id,
+                "message": f"Pod {pod_id} eliminado correctamente. Facturación de GPU congelada.",
+            },
+            status=status.HTTP_200_OK,
+        )

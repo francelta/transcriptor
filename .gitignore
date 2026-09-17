@@ -33,3 +33,15 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+# Local runtime logs & pids
+.logs/
+.pids
+
+# Audio test files
+*.aac
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.flac

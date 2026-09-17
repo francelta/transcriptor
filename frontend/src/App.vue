@@ -5,6 +5,7 @@ import AudioControls from './components/AudioControls.vue'
 import QuickNotationsBar from './components/QuickNotationsBar.vue'
 import KaraokeViewer from './components/KaraokeViewer.vue'
 import PodConfigModal from './components/PodConfigModal.vue'
+import PodProvisionPanel from './components/PodProvisionPanel.vue'
 
 const API_BASE = 'http://127.0.0.1:8002'
 
@@ -28,8 +29,24 @@ const activeTextareaIndex = ref(null)
 const workerStatus = ref('disconnected')
 const workerDetails = ref({ pod_host: '', pod_ssh_port: null, message: '' })
 const showPodConfigModal = ref(false)
+const showProvisionPanel = ref(false)
 
 const isGpuConnected = computed(() => workerStatus.value === 'connected')
+
+// ¿Tiene API Key ya configurada en el backend?
+const workerHasApiKey = ref(false)
+const workerConfiguredPodId = ref('')
+
+async function fetchWorkerConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/api/worker/config/`)
+    if (res.ok) {
+      const data = await res.json()
+      workerHasApiKey.value = !!(data.runpod_api_key)
+      workerConfiguredPodId.value = data.provisioned_pod_id || data.pod_id || ''
+    }
+  } catch (e) { /* silencioso */ }
+}
 
 // Tracking changes & Reset Modal
 const lastSavedState = ref('')
@@ -73,6 +90,29 @@ function handleWorkerConnected(data) {
 
 function openPodConfigModal() {
   showPodConfigModal.value = true
+}
+
+function openProvisionPanel() {
+  fetchWorkerConfig()
+  showProvisionPanel.value = true
+}
+
+function handleProvisioned(info) {
+  workerStatus.value = 'connected'
+  workerDetails.value = {
+    pod_host: info.podHost,
+    pod_ssh_port: info.podSshPort,
+    message: `GPU ${info.gpuInfo?.displayName || ''} lista`,
+  }
+  workerConfiguredPodId.value = info.podId
+  notify(`🎉 GPU lista: ${info.gpuInfo?.displayName || 'Pod'} @ ${info.gpuInfo?.price?.toFixed(3) || '?'} $/h`, 'success')
+}
+
+function handleTerminated() {
+  workerStatus.value = 'disconnected'
+  workerConfiguredPodId.value = ''
+  workerDetails.value = { pod_host: '', pod_ssh_port: null, message: '' }
+  notify('Pod terminado. Facturación congelada.', 'info')
 }
 
 
@@ -466,18 +506,19 @@ onUnmounted(() => {
         <!-- Badge de Estado GPU RunPod (🔴 Desconectado | 🟡 Inicializando Worker GPU | 🟢 Worker Listo) -->
         <button
           :class="['btn-gpu-badge', `status-${workerStatus}`]"
-          @click="openPodConfigModal"
-          :title="`Estado del Pod: ${workerStatus.toUpperCase()} - Haz clic para configurar o conectar`"
+          @click="openProvisionPanel"
+          :title="`Estado del Pod: ${workerStatus.toUpperCase()} - Haz clic para aprovisionar o gestionar`"
+          id="btn-gpu-status-badge"
         >
           <span class="status-indicator-dot"></span>
           <span v-if="workerStatus === 'connected'" class="status-label">
             🟢 Worker Listo <template v-if="workerDetails.pod_host">({{ workerDetails.pod_host }}:{{ workerDetails.pod_ssh_port }})</template>
           </span>
           <span v-else-if="workerStatus === 'provisioning'" class="status-label">
-            🟡 Inicializando Worker GPU...
+            🟡 Aprovisionando GPU...
           </span>
           <span v-else class="status-label">
-            🔴 Desconectado (Configurar RunPod)
+            🔴 Desconectado · Aprovisionar GPU
           </span>
         </button>
 
@@ -518,7 +559,19 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <!-- Modal de Configuración y Diagnóstico del Pod RunPod -->
+    <!-- Panel de Aprovisionamiento Automático 1-clic (badge header) -->
+    <PodProvisionPanel
+      :show="showProvisionPanel"
+      :has-api-key="workerHasApiKey"
+      :configured-pod-id="workerConfiguredPodId"
+      :initial-status="workerStatus === 'connected' ? 'ready' : (workerStatus === 'provisioning' ? 'provisioning' : 'idle')"
+      :api-base="API_BASE"
+      @close="showProvisionPanel = false"
+      @provisioned="handleProvisioned"
+      @terminated="handleTerminated"
+    />
+
+    <!-- Modal de Configuración Manual Avanzada del Pod RunPod -->
     <PodConfigModal
       :is-open="showPodConfigModal"
       :api-base="API_BASE"
